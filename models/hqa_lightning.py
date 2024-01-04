@@ -1,4 +1,4 @@
-from utils import device
+
 
 import numpy as np
 
@@ -126,32 +126,36 @@ class ResBlock(nn.Module):
         x = x + inp
         return mish(x)
 
-class VQCodebook(nn.Module):
-    def __init__(self, codebook_slots, codebook_dim, temperature=0.5):
+class VQCodebook(pl.LightningModule):
+    def __init__(self, 
+                 codebook_slots, 
+                 codebook_dim, 
+                 temperature=0.5):
         super().__init__()
         self.codebook_slots = codebook_slots
         self.codebook_dim = codebook_dim
         self.temperature = temperature
-        self.codebook = nn.Parameter(torch.randn(codebook_slots, codebook_dim))
+        self.codebook = nn.Embedding(codebook_slots, codebook_dim) 
         self.log_slots_const = np.log(self.codebook_slots)
 
     def z_e_to_z_q(self, z_e, soft=True):
         bs, feat_dim, w, h = z_e.shape
         assert feat_dim == self.codebook_dim
+        codebook = self.codebook.weight
         z_e = z_e.permute(0, 2, 3, 1).contiguous()
         z_e_flat = z_e.view(bs * w * h, feat_dim)
-        codebook_sqr = torch.sum(self.codebook ** 2, dim=1)
+        codebook_sqr = torch.sum(codebook ** 2, dim=1)
         z_e_flat_sqr = torch.sum(z_e_flat ** 2, dim=1, keepdim=True)
 
         distances = torch.addmm(
-            codebook_sqr + z_e_flat_sqr, z_e_flat, self.codebook.t(), alpha=-2.0, beta=1.0
+            codebook_sqr + z_e_flat_sqr, z_e_flat, codebook.t(), alpha=-2.0, beta=1.0
         )
 
         if soft is True:
             dist = RelaxedOneHotCategorical(self.temperature, logits=-distances)
             soft_onehot = dist.rsample()
             hard_indices = torch.argmax(soft_onehot, dim=1).view(bs, w, h)
-            z_q = (soft_onehot @ self.codebook).view(bs, w, h, feat_dim)
+            z_q = (soft_onehot @ codebook).view(bs, w, h, feat_dim)
             
             # entropy loss
             KL = dist.probs * (dist.probs.add(1e-9).log() + self.log_slots_const)
@@ -165,10 +169,10 @@ class VQCodebook(nn.Module):
                 hard_indices = dist.sample().view(bs, w, h)
                 hard_onehot = (
                     F.one_hot(hard_indices, num_classes=self.codebook_slots)
-                    .type_as(self.codebook)
+                    .type_as(nn.Parameter(torch.randn(self.codebook_slots, self.codebook_dim).to(self.device)))
                     .view(bs * w * h, self.codebook_slots)
                 )
-                z_q = (hard_onehot @ self.codebook).view(bs, w, h, feat_dim)
+                z_q = (hard_onehot @ codebook).view(bs, w, h, feat_dim)
                 
                 # entropy loss
                 KL = dist.probs * (dist.probs.add(1e-9).log() + np.log(self.codebook_slots))
@@ -181,7 +185,7 @@ class VQCodebook(nn.Module):
         return z_q, hard_indices, KL, commit_loss
 
     def lookup(self, ids: torch.Tensor):
-        return F.embedding(ids, self.codebook).permute(0, 3, 1, 2)
+        return self.codebook(ids).permute(0, 3, 1, 2)
 
     def quantize(self, z_e, soft=False):
         with torch.no_grad():
@@ -264,7 +268,9 @@ class HQA(pl.LightningModule):
         gs_temp=0.667,
         num_res_blocks=0,
         lr=4e-4,
-        decay=True
+        decay=True,
+        clip_grads=False,
+        codebook_init='uniform'
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['prev_model'])
@@ -281,18 +287,29 @@ class HQA(pl.LightningModule):
         self.normalize = GlobalNormalization(codebook_dim, scale=True)
         self.lr = lr
         self.decay = decay
+        self.clip_grads = clip_grads
 
         # Tells pytorch lightinig to use our custom training loop
         self.automatic_optimization = False
+        
+        self.init_codebook(codebook_init)
     
+    @torch.no_grad()
+    def init_codebook(self, codebook_init):
+        if codebook_init == 'uniform':
+            self.codebook.codebook.weight.data.uniform_(-1./self.codebook.codebook_slots, 1./self.codebook.codebook_dim)
+        elif codebook_init == 'normal':
+            self.codebook.codebook.weight.data.normal_()
+        else:
+            raise Exception("Invalid codebook initialization")
+            
+            
     def forward(self, x):
         z_e_lower = self.encode_lower(x)
         z_e = self.encoder(z_e_lower)
         z_q, indices, kl, commit_loss = self.codebook(z_e)
         z_e_lower_tilde = self.decoder(z_q)
         return z_e_lower_tilde, z_e_lower, z_q, z_e, indices, kl, commit_loss
-    
-
     
     def on_train_start(self):
         self.code_count = torch.zeros(self.codebook.codebook_slots, device=self.device, dtype=torch.float64)
@@ -316,21 +333,24 @@ class HQA(pl.LightningModule):
 
     def training_step(self,batch, batch_idx):
         x,_ = batch
-        optimizer = self.optimizers()
-        scheduler = self.lr_schedulers()
-
+        
         # anneal temperature
         if self.decay:
                 self.codebook.temperature = self.decay_temp_linear(step = self.global_step+1, 
                                                                    total_steps = self.trainer.max_epochs * self.trainer.num_training_batches, 
-                                                                   temp_base= self.codebook.temperature) 
+                                                                   temp_base= self.codebook.temperature)
         
+        optimizer = self.optimizers()
+        scheduler = self.lr_schedulers()
+    
         loss, indices, kl_loss = self.get_training_loss(x)
-        
+    
         optimizer.zero_grad()
-
+        
         self.manual_backward(loss)
-        nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+        
+        if self.clip_grads:
+            nn.utils.clip_grad_norm_(self.parameters(), 1.0)
 
         optimizer.step()
         scheduler.step()
@@ -349,7 +369,7 @@ class HQA(pl.LightningModule):
                 if min_frac_usage < 0.03:
                     print(f'reset code {min_used_code}')
                     moved_code = z_q_most_used + torch.randn_like(z_q_most_used) / 100
-                    self.codebook.codebook[min_used_code] = moved_code
+                    self.codebook.codebook.weight.data[min_used_code] = moved_code
                 self.code_count = torch.zeros_like(self.code_count, device=self.device)
     
         self.log("loss", loss, prog_bar=True)
@@ -404,7 +424,7 @@ class HQA(pl.LightningModule):
     def reconstruct_average(self, x, num_samples=10):
         """Average over stochastic edecodes"""
         b, c, h, w = x.shape
-        result = torch.empty((num_samples, b, c, h, w)).to(device)
+        result = torch.empty((num_samples, b, c, h, w)).to(self.device)
 
         for i in range(num_samples):
             result[i] = self.decode(self.quantize(self.encode(x)))
@@ -473,19 +493,21 @@ if __name__ == '__main__':
     dec_hidden_sizes = [16, 64, 256, 512, 1024]
     
     for i in range(1):
+        hqa_config = {
+            'enc_hidden_dim':enc_hidden_sizes[i],
+            'dec_hidden_dim':dec_hidden_sizes[i],
+            'codebook_slots':512,
+            'codebook_init':'uniform'
+        }
         if i == 0:
             hqa = HQA.init_bottom(
                 input_feat_dim=1,
-                enc_hidden_dim=enc_hidden_sizes[i],
-                dec_hidden_dim=dec_hidden_sizes[i],
-                codebook_slots=256
+                **hqa_config
             )
         else:
             hqa = HQA.init_higher(
                 hqa_prev,
-                enc_hidden_dim=enc_hidden_sizes[i],
-                dec_hidden_dim=dec_hidden_sizes[i],
-                codebook_slots=256
+                **hqa_config
             )
         logger = TensorBoardLogger("tb_logs", name="HQA_Mnist")
         trainer = pl.Trainer(max_epochs=20, logger=None, devices=1)
