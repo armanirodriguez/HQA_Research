@@ -9,27 +9,6 @@ from torchvision import datasets, transforms as T
 from models.hqa_lightning import HQA
 from gpt import GPT
 
-def load_heirarchical_model_from_checkpoints(
-    model_class,
-    checkpoints_dir,
-    n_layers=5,
-    **kwargs
-) -> pl.LightningModule:
-    """
-    Load a Heirarchical model from a directory of checkpoints for each layer
-    """
-    for layer in range(n_layers):
-        if layer == 0:
-            hae = model_class.load_from_checkpoint(
-                f"{checkpoints_dir}/layer{layer}.ckpt", prev_model=None, **kwargs
-            ).eval()
-        else:
-            hae = model_class.load_from_checkpoint(
-                f"{checkpoints_dir}/layer{layer}.ckpt", prev_model=hae_prev, **kwargs
-            ).eval()
-        hae_prev = hae
-    return hae
-
 class HQATransformer(pl.LightningModule):
     def __init__(self, hqa_model, keep_ratio=0.5):
         super(HQATransformer, self).__init__()
@@ -38,9 +17,9 @@ class HQATransformer(pl.LightningModule):
         self.gpt = GPT(
             vocab_size = self.vocab_size,
             block_size = 512,
-            n_layer = 24,
-            n_head = 16,
-            n_embd = 1024
+            n_layer = 12,
+            n_head = 8,
+            n_embd = 256
         )
         self.keep_ratio = keep_ratio
     
@@ -113,20 +92,25 @@ if __name__ == '__main__':
         T.ToTensor()
     ])
     ds_train = datasets.MNIST(root='data', train=True, download=True, transform=transform)
+    ds_test = datasets.MNIST(root='data', train=False, download=True, transform=transform)
     dl_train = DataLoader(ds_train, 
                           shuffle=True, 
                           batch_size=32, 
                           num_workers=32)
-    hqa_trainer = pl.Trainer(max_epochs=20, devices=[1])
+    dl_test = DataLoader(ds_test, 
+                          shuffle=False, 
+                          batch_size=32, 
+                          num_workers=32)
+    hqa_trainer = pl.Trainer(max_epochs=100, devices=[0,1])
     hqa_model = HQA.init_bottom(
                 input_feat_dim=1,
                 enc_hidden_dim=16,
                 dec_hidden_dim=16,
-                codebook_slots=512)
+                codebook_slots=64)
     hqa_trainer.fit(hqa_model, dl_train)
     
     hqa_transformer = HQATransformer(hqa_model)
-    hqa_transformer_trainer = pl.Trainer(max_epochs=20, devices=[1])
+    hqa_transformer_trainer = pl.Trainer(max_epochs=50, devices=[0,1], strategy='ddp_find_unused_parameters_true')
     hqa_transformer_trainer.fit(hqa_transformer, dl_train)
     
     
