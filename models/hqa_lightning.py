@@ -1,5 +1,3 @@
-
-
 import numpy as np
 
 import torch
@@ -15,11 +13,12 @@ from torchvision.datasets import MNIST
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import TensorBoardLogger
 
-import copy
+from sklearn.manifold import TSNE
 
+import os
 
-def mish(x):
-    return x * torch.tanh(F.softplus(x))
+# Mish Activation
+def mish(x): return x * torch.tanh(F.softplus(x))
 
 class Mish(torch.nn.Module):
     def __init__(self):
@@ -27,7 +26,8 @@ class Mish(torch.nn.Module):
 
     def forward(self, x):
         return mish(x)
-    
+
+# FlatCA LR Scheduler
 class FlatCA(_LRScheduler):
     def __init__(self, optimizer, steps, eta_min=0, last_epoch=-1):
         self.steps = steps
@@ -50,7 +50,7 @@ class FlatCA(_LRScheduler):
                     / 2
                 )
             return lr_list
-
+        
 class Encoder(nn.Module):
     """ Downsamples by a fac of 2 """
 
@@ -257,6 +257,8 @@ class GlobalNormalization(torch.nn.Module):
         return inputs
 
 class HQA(pl.LightningModule):
+    VISUALIZATION_DIR = 'vis'
+    SUBDIRS=[VISUALIZATION_DIR]
     def __init__(
         self,
         input_feat_dim,
@@ -270,7 +272,8 @@ class HQA(pl.LightningModule):
         lr=4e-4,
         decay=True,
         clip_grads=False,
-        codebook_init='uniform'
+        codebook_init='uniform',
+        output_dir=None
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['prev_model'])
@@ -293,6 +296,23 @@ class HQA(pl.LightningModule):
         self.automatic_optimization = False
         
         self.init_codebook(codebook_init)
+        
+        self.create_output = output_dir is not None 
+        if self.create_output:
+            self.output_dir = output_dir
+            try:
+                os.mkdir(output_dir)
+                for subdir in HQA.SUBDIRS:
+                    path = f'{output_dir}/{subdir}'
+                    os.mkdir(path)
+                    print(path)
+                    os.mkdir(f'{path}/layer{len(self)}')
+            except OSError:
+                pass
+                   
+                    
+          
+            
     
     @torch.no_grad()
     def init_codebook(self, codebook_init):
@@ -303,16 +323,20 @@ class HQA(pl.LightningModule):
         else:
             raise Exception("Invalid codebook initialization")
             
-            
+    def on_train_start(self):
+        # Register a buffer to track codeword usage
+        self.register_buffer(
+            'code_count', 
+            torch.zeros(self.codebook.codebook_slots, device=self.device, dtype=torch.float64)
+        )
+        self.codebook_resets = 0
+          
     def forward(self, x):
         z_e_lower = self.encode_lower(x)
         z_e = self.encoder(z_e_lower)
         z_q, indices, kl, commit_loss = self.codebook(z_e)
         z_e_lower_tilde = self.decoder(z_q)
         return z_e_lower_tilde, z_e_lower, z_q, z_e, indices, kl, commit_loss
-    
-    def on_train_start(self):
-        self.code_count = torch.zeros(self.codebook.codebook_slots, device=self.device, dtype=torch.float64)
     
     def get_training_loss(self, x):
         recon, _, _, _, indices, KL, commit_loss = self(x)
@@ -351,7 +375,7 @@ class HQA(pl.LightningModule):
         
         if self.clip_grads:
             nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-
+        
         optimizer.step()
         scheduler.step()
 
@@ -360,18 +384,15 @@ class HQA(pl.LightningModule):
 
         
         if batch_idx > 0 and batch_idx % 20 == 0:
-            with torch.no_grad():
-                
-                max_count, most_used_code = torch.max(self.code_count, dim=0)
-                frac_usage = self.code_count / max_count
-                z_q_most_used = self.codebook.lookup(most_used_code.view(1, 1, 1)).squeeze()
-                min_frac_usage, min_used_code = torch.min(frac_usage, dim=0)
-                if min_frac_usage < 0.03:
-                    print(f'reset code {min_used_code}')
-                    moved_code = z_q_most_used + torch.randn_like(z_q_most_used) / 100
-                    self.codebook.codebook.weight.data[min_used_code] = moved_code
-                self.code_count = torch.zeros_like(self.code_count, device=self.device)
-    
+            self.reset_least_used_codeword()
+            if self.create_output:
+                tsne = self.visualize_codebook()
+                plt.clf()
+                plt.scatter(tsne[:, 0], tsne[:, 1], marker='.', s=1)
+                plt.title(f'Reset {self.codebook_resets} Epoch {self.current_epoch} Step {self.global_step} ')
+                plt.savefig(f'{self.output_dir}/{HQA.VISUALIZATION_DIR}/layer{len(self)}/reset{self.codebook_resets}.png')
+        
+        
         self.log("loss", loss, prog_bar=True)
         self.log("kl", kl_loss, prog_bar=True)
         return loss
@@ -380,41 +401,62 @@ class HQA(pl.LightningModule):
         x,_ = batch
         y = self.reconstruct(x)
         loss = self.recon_loss(y,x)
-        self.log("validation_recon_loss", loss, prog_bar=True)
+        self.log("validation_recon_loss", loss, prog_bar=True, sync_dist=True)
         return loss
-    
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         lr_scheduler = FlatCA(optimizer, steps=self.trainer.max_epochs * self.trainer.num_training_batches, eta_min=4e-5)
         return [optimizer], [lr_scheduler]
     
+    @torch.no_grad()
+    def reset_least_used_codeword(self):
+        max_count, most_used_code = torch.max(self.code_count, dim=0)
+        frac_usage = self.code_count / max_count
+        z_q_most_used = self.codebook.lookup(most_used_code.view(1, 1, 1)).squeeze()
+        min_frac_usage, min_used_code = torch.min(frac_usage, dim=0)
+        if min_frac_usage < 0.03:
+            print(f'reset code {min_used_code}')
+            moved_code = z_q_most_used + torch.randn_like(z_q_most_used) / 100
+            self.codebook.codebook.weight.data[min_used_code] = moved_code
+        self.code_count = torch.zeros_like(self.code_count, device=self.device)
+        self.codebook_resets += 1
+    
+    def visualize_codebook(self):
+        """ Perform t-SNE visualization on the VQ-Codebook """
+        latents = self.codebook.codebook.weight.data.detach().cpu().numpy()
+        tsne = TSNE(n_components=2)
+        latents_tsne = tsne.fit_transform(latents)
+        return latents_tsne
+        
+    
+    @torch.no_grad()
     def encode_lower(self, x):
         if self.prev_model is None:
             return x
         else:
-            with torch.no_grad():
-                z_e_lower = self.prev_model.encode(x)
-                z_e_lower = self.normalize(z_e_lower)
-            return z_e_lower
+            z_e_lower = self.prev_model.encode(x)
+            z_e_lower = self.normalize(z_e_lower)
+        return z_e_lower
+    
+    @torch.no_grad()
     def encode(self, x):
-        with torch.no_grad():
-            z_e_lower = self.encode_lower(x)
-            z_e = self.encoder(z_e_lower)
+        z_e_lower = self.encode_lower(x)
+        z_e = self.encoder(z_e_lower)
         return z_e
-        
+    
+    @torch.no_grad()
     def decode_lower(self, z_q_lower):
-        with torch.no_grad():
-            recon = self.prev_model.decode(z_q_lower)           
-        return recon
+       return self.prev_model.decode(z_q_lower)
 
+    @torch.no_grad()
     def decode(self, z_q):
-        with torch.no_grad():
-            if self.prev_model is not None:
-                z_e_u = self.normalize.unnorm(self.decoder(z_q))
-                z_q_lower_tilde = self.prev_model.quantize(z_e_u)
-                recon = self.decode_lower(z_q_lower_tilde)
-            else:
-                recon = self.decoder(z_q)
+        if self.prev_model is not None:
+            z_e_u = self.normalize.unnorm(self.decoder(z_q))
+            z_q_lower_tilde = self.prev_model.quantize(z_e_u)
+            recon = self.decode_lower(z_q_lower_tilde)
+        else:
+            recon = self.decoder(z_q)
         return recon
 
     def quantize(self, z_e):
@@ -473,8 +515,8 @@ class HQA(pl.LightningModule):
         model = HQA(input_feat_dim,prev_model=None, **kwargs)
         return model
 
-if __name__ == '__main__':
-    #torch.set_float32_matmul_precision('medium')
+def train_mnist(n_epochs=20):
+    torch.set_float32_matmul_precision('medium')
     transform = transforms.Compose(
         [
             transforms.Resize(32),
@@ -497,7 +539,8 @@ if __name__ == '__main__':
             'enc_hidden_dim':enc_hidden_sizes[i],
             'dec_hidden_dim':dec_hidden_sizes[i],
             'codebook_slots':512,
-            'codebook_init':'uniform'
+            'codebook_init':'uniform',
+            'output_dir':'hqa_mnist_output'
         }
         if i == 0:
             hqa = HQA.init_bottom(
@@ -510,6 +553,20 @@ if __name__ == '__main__':
                 **hqa_config
             )
         logger = TensorBoardLogger("tb_logs", name="HQA_Mnist")
-        trainer = pl.Trainer(max_epochs=20, logger=None, devices=1)
+        trainer = pl.Trainer(max_epochs=n_epochs, logger=None, devices=2)
+        
         trainer.fit(model=hqa, train_dataloaders=dl_train, val_dataloaders=dl_test)
+        hqa.eval()
         hqa_prev = hqa
+    return hqa
+    
+    
+    
+    
+    
+if __name__ == '__main__':
+    from matplotlib import pyplot as plt
+    from tqdm import tqdm
+    model = train_mnist(n_epochs=10)
+    
+        
