@@ -300,19 +300,9 @@ class HQA(pl.LightningModule):
         self.create_output = output_dir is not None 
         if self.create_output:
             self.output_dir = output_dir
-            try:
-                os.mkdir(output_dir)
-                for subdir in HQA.SUBDIRS:
-                    path = f'{output_dir}/{subdir}'
-                    os.mkdir(path)
-                    print(path)
-                    os.mkdir(f'{path}/layer{len(self)}')
-            except OSError:
-                pass
-                   
-                    
-          
-            
+            for subdir in HQA.SUBDIRS:
+                path = os.path.join(output_dir, subdir, f'layer{len(self)}')
+                os.makedirs(path, exist_ok=True)
     
     @torch.no_grad()
     def init_codebook(self, codebook_init):
@@ -373,8 +363,7 @@ class HQA(pl.LightningModule):
         
         self.manual_backward(loss)
         
-        if self.clip_grads:
-            nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(self.parameters(), 1.0)
         
         optimizer.step()
         scheduler.step()
